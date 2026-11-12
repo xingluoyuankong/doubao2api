@@ -1,0 +1,32 @@
+# doubao2api-unified - https://doubao2api.xzxyuan.l.cd -> 127.0.0.1:8793
+# 草稿，未安装。模板照 xhx2api（SSE 不缓冲、超时 3600s）。
+# DNS：doubao2api.xzxyuan.l.cd A -> 16.176.174.27，走 DNSHE 浏览器面板加记录，
+# 动手前面板读数与公网 DNS 交叉核对；certbot --nginx 补 443。
+# No limit_req / tarpit: auth is the service-side DOUBAO_API_KEY.
+server {
+    client_max_body_size 64m;
+    client_body_timeout 300s;
+    server_name doubao2api.xzxyuan.l.cd;
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
+    location / {
+        proxy_pass http://127.0.0.1:8793;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        # SSE: no buffering, long timeouts (chat/video generation can run minutes)
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        gzip off;
+    }
+
+    listen 80;
+}

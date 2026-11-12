@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.doubao_session.json
+.doubao_browser/
+.qianwen_browser/
+.env
+*.log

@@ -1,0 +1,8 @@
+fastapi>=0.100
+uvicorn>=0.20
+httpx>=0.25
+pydantic>=2.0
+# Playwright is INTENTIONALLY not a main dependency: the signing fallback
+# (signing_fallback.py) imports it lazily and only on a signature failure.
+# Deployment adds: playwright==1.44.0  +  playwright-stealth
+# (lzA6 pins) only if the fallback is enabled, plus `playwright install chromium`.

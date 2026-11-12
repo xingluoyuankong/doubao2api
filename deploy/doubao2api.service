@@ -1,0 +1,20 @@
+[Unit]
+Description=doubao2api-unified (FastAPI, 127.0.0.1:8793)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/doubao2api-unified
+EnvironmentFile=/opt/doubao2api-unified/.env
+ExecStart=/opt/doubao2api-unified/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8793
+Restart=on-failure
+RestartSec=5
+# 资源上限：纯 HTTP 主路径约 50-150MB；Playwright 兜底是按需拉起、用完即关，
+# 常驻浏览器不装进本服务。按主人纪律钉单核。
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target
