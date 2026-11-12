@@ -57,23 +57,44 @@ def load_cookies() -> Dict[str, str]:
     return {str(k): str(v) for k, v in cookies.items()}
 
 
+def _read_session_file() -> Dict[str, Any]:
+    path = session_file_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_verified() -> bool:
+    """True only after an upstream /chat/completion returned 200 (see
+    mark_verified). A stored session alone never verifies itself."""
+    return bool(_read_session_file().get("verified", False))
+
+
 def session_status() -> Dict[str, Any]:
     cookies = load_cookies()
     return {
         "logged_in": bool(cookies.get("sessionid")),
-        "verified": False,  # only an upstream 200 can set this True; skeleton never does
+        "verified": is_verified(),
         "has_sessionid": bool(cookies.get("sessionid")),
-        "methods": ["qr-login", "cookie", "session-import"],
+        "methods": ["qr-login", "cookie", "session-import", "verify"],
         "session_file": str(session_file_path()),
     }
 
 
 def store_session(cookies: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Store a session file (0600). Returns status, never the values."""
+    """Store a session file (0600). Returns status, never the values.
+
+    A newly stored session is always unverified: verification belongs to
+    the session's own upstream call, not to the act of storing it.
+    """
     if not cookies.get("sessionid"):
         raise ValueError("sessionid is required")
     path = session_file_path()
-    data: Dict[str, Any] = {"cookies": cookies, "params": params or {}}
+    data: Dict[str, Any] = {"cookies": cookies, "params": params or {}, "verified": False}
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
         os.chmod(path, 0o600)
@@ -81,3 +102,28 @@ def store_session(cookies: Dict[str, str], params: Optional[Dict[str, Any]] = No
         pass
     return {"stored": True, "verified": False,
             "note": "已保存，未验证：只有上游真正返回 200 后 verified 才会变 true。"}
+
+
+def load_session_params() -> Dict[str, Any]:
+    """Device params stored alongside the cookies (device_id/web_id/fp/
+    msToken/a_bogus/tea_uuid), or {} when none were imported."""
+    params = _read_session_file().get("params", {})
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def mark_verified() -> bool:
+    """Mark the stored session verified after an upstream 200.
+
+    Returns False when there is no stored session to mark.
+    """
+    data = _read_session_file()
+    if not data.get("cookies", {}).get("sessionid"):
+        return False
+    data["verified"] = True
+    path = session_file_path()
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return True

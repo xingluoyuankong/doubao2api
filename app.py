@@ -1,23 +1,34 @@
-"""doubao2api-unified — skeleton FastAPI gateway.
+"""doubao2api-unified — FastAPI gateway.
 
-Status: local skeleton only. No upstream client is wired yet on purpose:
-without a Doubao account every upstream call must fail loudly (401 when
+Upstream: Hu410-protocol client (doubao_client.py, POST /chat/completion).
+Chat requests are built from the model's routing profile (models.py):
+model_item_key is written in three places in the request body
+(conversation_init_ext / model_config / aggregate_params) plus
+agent_mode / conversation_mode / reasoning_effort.
+
+Without a Doubao account every upstream call still fails loudly (401 when
 there is no session, 503 when the session is unverified), never with a
-fabricated success. See integrated/DESIGN.md.
+fabricated success. A session becomes verified only after
+POST /v1/session/verify gets a real upstream 200. See DESIGN.md.
 """
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict
+import time
+import uuid
+from typing import Any, AsyncGenerator, Dict
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from auth import load_cookies, session_status, store_session
-from models import WEB_MODELS, list_models_payload
+from auth import (is_verified, load_cookies, load_session_params,
+                  mark_verified, session_status, store_session)
+from doubao_client import DoubaoClient, UpstreamError, extract_text_from_event
+from models import WEB_MODELS, find_model, list_models_payload
 from signing_fallback import SigningUnavailable, is_signature_error  # noqa: F401  (fallback contract)
 
-app = FastAPI(title="doubao2api-unified", version="0.1.0-skeleton")
+app = FastAPI(title="doubao2api-unified", version="0.2.0-work-models")
 
 # In-memory expert-degradation flag (wang ExpertQuotaTracker, skeleton form).
 _EXPERT_DEGRADED = False
@@ -55,13 +66,15 @@ def _upstream_error():
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     st = session_status()
-    return {"status": "ok" if st["logged_in"] else "not_ready",
-            "logged_in": st["logged_in"], "verified": False,
+    return {"status": "ok" if st["verified"] else "not_ready",
+            "logged_in": st["logged_in"], "verified": st["verified"],
             "expert_degraded": _EXPERT_DEGRADED,
             "qianwen_ready": False,
             "models_routable": len(WEB_MODELS),
-            "skeleton": True,
-            "note": "骨架：未接上游。logged_in 只表示本地有 sessionid，不代表上游可用。"}
+            "routing_verified_count": sum(1 for m in WEB_MODELS if m.get("verified_routing")),
+            "upstream_client": "hu410-chat-completion",
+            "skeleton": False,
+            "note": "已接 Hu410 协议上游客户端（POST /chat/completion）。verified 仍 false：需账号登录并经 /v1/session/verify 拿到一次真实上游 200；logged_in 只表示本地有 sessionid，不代表上游可用。"}
 
 
 @app.get("/v1/models")
@@ -75,10 +88,11 @@ async def list_models(request: Request):
 @app.get("/admin")
 async def admin():
     st = session_status()
-    return {"service": "doubao2api-unified", "version": "0.1.0-skeleton",
-            "logged_in": st["logged_in"], "verified": False,
+    return {"service": "doubao2api-unified", "version": "0.2.0-work-models",
+            "logged_in": st["logged_in"], "verified": st["verified"],
             "models_routable": len(WEB_MODELS),
-            "note": "骨架管理页：只返状态，不暴露凭证。"}
+            "routing_verified_count": sum(1 for m in WEB_MODELS if m.get("verified_routing")),
+            "note": "管理页：只返状态，不暴露凭证。verified_routing 全为 false，直到账号实测放行。"}
 
 
 @app.get("/v1/session/status")
@@ -134,9 +148,155 @@ def _upstream_stub(request: Request):
     return _upstream_error()
 
 
+def _resolve_chat_model(body: Dict[str, Any]):
+    """Resolve the requested model id to a WEB_MODELS chat entry.
+
+    Returns (entry, None) on success, (None, error_response) on failure.
+    Unknown ids and non-chat models (image/music/video/qianwen via this
+    endpoint) are rejected with 400 -- before any session check, so the
+    caller learns the model is wrong instead of getting a misleading 401.
+    """
+    model_id = (body or {}).get("model") or "doubao"
+    entry = find_model(model_id)
+    if entry is None:
+        return None, JSONResponse(
+            {"error": {"code": "model_not_found",
+                       "message": f"未知模型 {model_id}：见 GET /v1/models（共 {len(WEB_MODELS)} 个可路由模型）"}},
+            status_code=400)
+    if entry.get("kind") != "chat":
+        return None, JSONResponse(
+            {"error": {"code": "model_not_chat",
+                       "message": f"模型 {model_id} 不是聊天模型（kind={entry.get('kind')}），请用对应的生成端点"}},
+            status_code=400)
+    return entry, None
+
+
+def _openai_error(code: str, message: str, status: int) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}},
+                        status_code=status)
+
+
+def _openai_response(model_id: str, text: str) -> Dict[str, Any]:
+    now = int(time.time())
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model_id,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "note": "usage 为 0：上游 SSE 不返回 token 数，不编造。",
+    }
+
+
+async def _chat_stream_sse(model_id: str, messages: list, profile: Dict[str, Any]):
+    """Yield OpenAI-format SSE chunks from the upstream text stream."""
+    client = DoubaoClient(load_cookies(), load_session_params())
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    def chunk(content: str, finish: str | None = None) -> str:
+        payload = {"id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                   "model": model_id,
+                   "choices": [{"index": 0,
+                                "delta": {"content": content} if content else {},
+                                "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    try:
+        async for event in client.chat_completion_stream(messages, profile):
+            text = extract_text_from_event(event)
+            if text and not text.startswith("[错误]"):
+                yield chunk(text)
+            elif event.get("event") in ("error", "STREAM_ERROR"):
+                err = (event.get("data", {}) or {}).get("error_msg", "upstream error")
+                yield f"data: {json.dumps({'error': {'code': 'upstream_error', 'message': str(err)}}, ensure_ascii=False)}\n\n"
+                return
+            if event.get("event") in ("SSE_REPLY_END", "STREAM_END"):
+                break
+    except UpstreamError as exc:
+        yield f"data: {json.dumps({'error': {'code': 'upstream_error', 'message': str(exc)}}, ensure_ascii=False)}\n\n"
+        return
+    yield chunk("", finish="stop")
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    return _upstream_stub(request)
+    err = _auth_error(request)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("bad_request", "请求体不是合法 JSON", 400)
+    if not isinstance(body, dict):
+        return _openai_error("bad_request", "请求体必须是 JSON 对象", 400)
+    profile, model_err = _resolve_chat_model(body)
+    if model_err is not None:
+        return model_err
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not any(
+            isinstance(m, dict) and m.get("role") == "user" and m.get("content")
+            for m in messages):
+        return _openai_error("bad_request", "messages 里至少要有一条 user 消息", 400)
+    if not load_cookies().get("sessionid"):
+        return _upstream_error()  # 401 not_logged_in
+    if not is_verified():
+        return _upstream_error()  # 503 upstream_not_verified
+    model_id = profile["id"]
+    try:
+        if body.get("stream"):
+            return StreamingResponse(
+                _chat_stream_sse(model_id, messages, profile),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        client = DoubaoClient(load_cookies(), load_session_params())
+        text = await client.chat_completion(messages, profile)
+        return _openai_response(model_id, text)
+    except UpstreamError as exc:
+        return _openai_error("upstream_error", str(exc), 502)
+    except Exception as exc:  # httpx timeouts etc. -- surface, never fake
+        return _openai_error("upstream_error", f"上游调用失败：{type(exc).__name__}: {exc}", 502)
+
+
+@app.post("/v1/session/verify")
+async def session_verify(request: Request):
+    """Verify the stored session with one minimal real upstream call.
+
+    Sends "hi" to the default fast model (doubao, need_login false) and
+    marks the session verified only when upstream returns a real 200 SSE
+    reply. No production credential is used here: only the session already
+    stored on this deployment. On failure the session stays unverified.
+    """
+    err = _auth_error(request)
+    if err is not None:
+        return err
+    if not load_cookies().get("sessionid"):
+        return _upstream_error()  # 401 not_logged_in
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    model_id = (body or {}).get("model") or "doubao"
+    profile, model_err = _resolve_chat_model({"model": model_id})
+    if model_err is not None:
+        return model_err
+    try:
+        client = DoubaoClient(load_cookies(), load_session_params())
+        text = await client.chat_completion(
+            [{"role": "user", "content": "hi"}], profile, timeout_s=60.0)
+    except UpstreamError as exc:
+        return _openai_error("upstream_error",
+                             f"上游验证失败，会话仍未验证：{exc}", 502)
+    except Exception as exc:
+        return _openai_error("upstream_error",
+                             f"上游验证失败，会话仍未验证：{type(exc).__name__}: {exc}", 502)
+    mark_verified()
+    return {"verified": True, "model": model_id,
+            "reply_preview": text[:200],
+            "note": "已验证：上游真实返回 200。此后聊天走上游，不再报 503。"}
 
 
 @app.post("/v1/images/generations")
