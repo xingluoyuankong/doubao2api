@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · doubao2api 控制台</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f4f5f7;color:#222;font-size:14px;line-height:1.6}
+  main{max-width:420px;margin:80px auto 0;padding:16px}
+  section{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px}
+  h1{margin:0 0 4px;font-size:20px}
+  p{margin:0 0 16px;color:#6b7280;font-size:13px}
+  label{font-weight:600}
+  input{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;margin:4px 0 12px}
+  button{width:100%;background:#2563eb;color:#fff;border:0;border-radius:6px;padding:10px 16px;font-size:15px;cursor:pointer}
+  button:disabled{background:#9ca3af;cursor:not-allowed}
+  .err{color:#dc2626;margin-top:12px;min-height:20px}
+  .note{color:#6b7280;font-size:13px;margin-top:16px}
+</style>
+</head>
+<body>
+<main>
+<section>
+  <h1>doubao2api 控制台</h1>
+  <p>请先登录。账号密码由管理员设置，未登录无法查看控制台或调用接口。</p>
+  <form id="login-form">
+    <label for="username">账号</label>
+    <input id="username" name="username" value="admin" autocomplete="username">
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" placeholder="管理员密码">
+    <button id="submit" type="submit">登录</button>
+  </form>
+  <div class="err" id="err"></div>
+  <p class="note">连续 5 次登录失败将锁定 10 分钟。登录成功后 7 天内免登录，重启服务后需重新登录。</p>
+</section>
+</main>
+<script>
+document.getElementById('login-form').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const btn = document.getElementById('submit');
+  const err = document.getElementById('err');
+  btn.disabled = true;
+  err.textContent = '';
+  try{
+    const r = await fetch('/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: document.getElementById('username').value.trim(),
+                            password: document.getElementById('password').value})});
+    const body = await r.json().catch(function(){ return {}; });
+    if (r.status === 200){ location.href = '/'; return; }
+    err.textContent = (body && body.error && body.error.message) || '登录失败';
+  }catch(e){ err.textContent = '登录失败：' + e; }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>

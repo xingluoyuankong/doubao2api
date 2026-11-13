@@ -4,6 +4,15 @@
 
 > **状态：已部署 AWS 悉尼，域名 `doubao2api.xzxyuan.l.cd`，无账号实测。** 仓库 `xingluoyuankong/doubao2api`，服务端口 127.0.0.1:8793。无账号时 `/health` 为 `not_ready`，聊天/生图一律 401，账号实测待主人提供豆包账号后做。
 
+## 管理员鉴权（2026-11-13 新增，v0.2.2）
+
+控制台此前任何人打开就能用，已锁上。账号固定 `admin`，密码只以 SHA-256 摘要形式存在服务器 `.env`（`DOUBAO2API_ADMIN_PASSWORD_SHA256`），明文密码与摘要都不进仓库、不进代码、不进 README。登录页是前端原生表单，不是浏览器弹框 Basic Auth。
+
+- 未登录时：`GET /` 返回登录页（`static/login.html`）；`GET /static/index.html`、`/v1/chat/completions`、`/v1/session/*`、`GET /v1/session/status`、`GET /admin`、全部生图/视频/音频/文件端点一律 401。
+- 公开不动：`GET /health`、`GET /v1/models` 仍公开（newapi 读模型目录和健康检查要用）。
+- 登录成功发 7 天 HttpOnly session cookie（随机 token，只存内存，重启重登）；`POST /auth/logout` 登出。登录失败统一显示“账号或密码错误”，不区分账号错还是密码错；同一 IP 连续 5 次错锁 10 分钟（防爆破锁，不是限流）。
+- 本地测试时在环境变量里设摘要再跑 pytest，见 `tests/test_smoke.py` 顶部。
+
 ## 前端控制台（2026-11-13 新增，v0.2.1）
 
 根路径 `/` 返回控制台（单文件 `static/index.html`，内联 CSS/JS，不依赖外部 CDN）。内容：服务状态（`/health`）、模型列表（34 个，分豆包聊天 / 豆包工作 10 个 / 通义千问 / 生成模型四组，带 `model_item_key`、倍率、`verified_routing` 标注）、登录区（扫码登录、Cookie 导入、会话导入，对应现有后端接口）、验证按钮（`POST /v1/session/verify`）、聊天测试区（选模型发一句话，无账号显示 401 不伪造成功）。后端只加了 `/` 与 `/static/*` 两个路由，现有 API 一字未动。

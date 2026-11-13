@@ -41,7 +41,7 @@
 <body>
 <header>
   <h1>doubao2api 控制台</h1>
-  <p>豆包 + 通义千问网页端反代整合版 · 上游 Hu410 协议 POST /chat/completion · <span id="ver">v0.2.1-console</span></p>
+  <p>豆包 + 通义千问网页端反代整合版 · 上游 Hu410 协议 POST /chat/completion · <span id="ver">v0.2.2-admin-auth</span> · <button class="secondary" style="background:#4b5563" onclick="logout()">登出管理员</button></p>
 </header>
 <main>
 
@@ -110,8 +110,10 @@
 <section>
   <h2>接口一览</h2>
   <table>
-    <tr><td><code>GET /health</code></td><td>服务状态</td></tr>
-    <tr><td><code>GET /v1/models</code></td><td>模型列表（34 个可路由 + reference_models）</td></tr>
+    <tr><td><code>GET /health</code></td><td>服务状态（公开）</td></tr>
+    <tr><td><code>GET /v1/models</code></td><td>模型列表（34 个可路由 + reference_models，公开）</td></tr>
+    <tr><td><code>POST /auth/login</code></td><td>管理员登录（账号 admin，5 次错锁 10 分钟）</td></tr>
+    <tr><td><code>POST /auth/logout</code></td><td>管理员登出</td></tr>
     <tr><td><code>POST /v1/chat/completions</code></td><td>聊天（OpenAI 兼容，stream 可选）</td></tr>
     <tr><td><code>POST /v1/session/qr-login</code></td><td>扫码登录</td></tr>
     <tr><td><code>POST /v1/session/cookie</code></td><td>Cookie 导入</td></tr>
@@ -131,9 +133,14 @@ const GEN_IDS = ["doubao-image","doubao-music","doubao-video"];
 function show(id, obj){ document.getElementById(id).textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2); }
 async function jfetch(url, opts){
   const r = await fetch(url, opts);
+  if (r.status === 401){ location.href = '/'; throw new Error('未登录管理员'); }
   const t = await r.text();
   let body; try { body = JSON.parse(t); } catch(e){ body = t; }
   return {status: r.status, body: body};
+}
+async function logout(){
+  await fetch('/auth/logout', {method: 'POST'});
+  location.href = '/';
 }
 function kv(k, v){ return '<div class="kv"><b>'+k+'</b><span>'+v+'</span></div>'; }
 async function loadHealth(){

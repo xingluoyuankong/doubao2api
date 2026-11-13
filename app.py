@@ -21,35 +21,104 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from admin_auth import (COOKIE_NAME, SESSION_TTL_S, attempt_login,
+                        check_admin_cookie, invalidate_session)
 from auth import (is_verified, load_cookies, load_session_params,
                   mark_verified, session_status, store_session)
 from doubao_client import DoubaoClient, UpstreamError, extract_text_from_event
 from models import WEB_MODELS, find_model, list_models_payload
 from signing_fallback import SigningUnavailable, is_signature_error  # noqa: F401  (fallback contract)
 
-app = FastAPI(title="doubao2api-unified", version="0.2.1-console")
+app = FastAPI(title="doubao2api-unified", version="0.2.2-admin-auth")
 
 # In-memory expert-degradation flag (wang ExpertQuotaTracker, skeleton form).
 _EXPERT_DEGRADED = False
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
-if _STATIC_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+def _admin_error(request: Request):
+    """401 unless the request carries a live admin session cookie."""
+    if check_admin_cookie(request) is None:
+        return JSONResponse({"error": {"code": "admin_unauthorized",
+                                       "message": "未登录管理员：请先在控制台登录页登录（账号 admin）。"}},
+                            status_code=401)
+    return None
 
 
 @app.get("/", include_in_schema=False)
-async def console_index():
-    """Frontend console: single-file static page (no CDN dependency).
+async def console_index(request: Request):
+    """Root: console for a logged-in admin, login page otherwise.
 
-    Root used to 404 ({"detail": "Not Found"}); it now serves the console.
+    The console used to be open to anyone who opened the domain; it now
+    requires the admin login (see admin_auth.py). /health and /v1/models
+    stay public: newapi reads the model catalog and health from them.
     """
+    if check_admin_cookie(request) is None:
+        login = _STATIC_DIR / "login.html"
+        if not login.is_file():
+            return JSONResponse({"detail": "登录页缺失：static/login.html 不存在"}, status_code=500)
+        return FileResponse(str(login), media_type="text/html; charset=utf-8")
     index = _STATIC_DIR / "index.html"
     if not index.is_file():
         return JSONResponse({"detail": "控制台页面缺失：static/index.html 不存在"}, status_code=500)
     return FileResponse(str(index), media_type="text/html; charset=utf-8")
+
+
+@app.get("/static/login.html", include_in_schema=False)
+async def login_page():
+    """The login page itself must stay public, or nobody could log in."""
+    login = _STATIC_DIR / "login.html"
+    if not login.is_file():
+        return JSONResponse({"detail": "登录页缺失：static/login.html 不存在"}, status_code=500)
+    return FileResponse(str(login), media_type="text/html; charset=utf-8")
+
+
+@app.get("/static/index.html", include_in_schema=False)
+async def console_page(request: Request):
+    """The console body is admin-only; unauthenticated requests get 401."""
+    err = _admin_error(request)
+    if err is not None:
+        return err
+    index = _STATIC_DIR / "index.html"
+    if not index.is_file():
+        return JSONResponse({"detail": "控制台页面缺失：static/index.html 不存在"}, status_code=500)
+    return FileResponse(str(index), media_type="text/html; charset=utf-8")
+
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    user = check_admin_cookie(request)
+    return {"logged_in": user is not None, "username": user}
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, message, token = attempt_login(
+        request, str(body.get("username", "")), str(body.get("password", "")))
+    if token is None:
+        return JSONResponse({"error": {"code": "login_failed", "message": message}},
+                            status_code=status)
+    resp = JSONResponse({"logged_in": True, "username": "admin", "message": message})
+    resp.set_cookie(COOKIE_NAME, token, max_age=SESSION_TTL_S, httponly=True,
+                    samesite="lax", path="/")
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    invalidate_session(request)
+    resp = JSONResponse({"logged_in": False, "message": "已登出"})
+    resp.delete_cookie(COOKIE_NAME, path="/")
+    return resp
 
 
 def _require_api_key(request: Request) -> bool:
@@ -104,9 +173,12 @@ async def list_models(request: Request):
 
 
 @app.get("/admin")
-async def admin():
+async def admin(request: Request):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     st = session_status()
-    return {"service": "doubao2api-unified", "version": "0.2.1-console",
+    return {"service": "doubao2api-unified", "version": "0.2.2-admin-auth",
             "logged_in": st["logged_in"], "verified": st["verified"],
             "models_routable": len(WEB_MODELS),
             "routing_verified_count": sum(1 for m in WEB_MODELS if m.get("verified_routing")),
@@ -114,12 +186,18 @@ async def admin():
 
 
 @app.get("/v1/session/status")
-async def session_status_ep():
+async def session_status_ep(request: Request):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     return session_status()
 
 
 @app.post("/v1/session/qr-login")
-async def qr_login():
+async def qr_login(request: Request):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     # Skeleton: no browser runtime here, so no QR can be honestly produced.
     return JSONResponse(
         {"status": "unavailable_in_skeleton", "code": "qr_login_unavailable_in_skeleton",
@@ -129,7 +207,10 @@ async def qr_login():
 
 
 @app.post("/v1/session/cookie")
-async def cookie_login(body: Dict[str, Any]):
+async def cookie_login(request: Request, body: Dict[str, Any]):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     sessionid = (body or {}).get("sessionid", "")
     if not isinstance(sessionid, str) or not sessionid.strip():
         return JSONResponse({"error": {"code": "bad_request",
@@ -141,12 +222,15 @@ async def cookie_login(body: Dict[str, Any]):
 
 
 @app.post("/v1/session/import")
-async def session_import(body: Dict[str, Any]):
+async def session_import(request: Request, body: Dict[str, Any]):
     """Import an already-logged-in browser session (cookies + device params).
 
     This is the feasible 'OAuth / session import' path: Doubao has no public
     OAuth client flow for a 2api gateway, so the import is a session file.
     """
+    err = _admin_error(request)
+    if err is not None:
+        return err
     cookies = (body or {}).get("cookies", {})
     params = (body or {}).get("params", {})
     if not isinstance(cookies, dict) or not cookies.get("sessionid"):
@@ -160,6 +244,9 @@ async def session_import(body: Dict[str, Any]):
 
 
 def _upstream_stub(request: Request):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     err = _auth_error(request)
     if err is not None:
         return err
@@ -242,6 +329,9 @@ async def _chat_stream_sse(model_id: str, messages: list, profile: Dict[str, Any
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    err = _admin_error(request)
+    if err is not None:
+        return err
     err = _auth_error(request)
     if err is not None:
         return err
@@ -288,6 +378,9 @@ async def session_verify(request: Request):
     reply. No production credential is used here: only the session already
     stored on this deployment. On failure the session stays unverified.
     """
+    err = _admin_error(request)
+    if err is not None:
+        return err
     err = _auth_error(request)
     if err is not None:
         return err

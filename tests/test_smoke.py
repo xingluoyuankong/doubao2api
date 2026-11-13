@@ -7,12 +7,20 @@ Hu410 request builder (offline: it only builds the request body, it never
 touches the network).
 Run:  python -m pytest tests/ -q   (from integrated/)
 """
+import hashlib
 import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Admin auth test fixture: the digest below is for a throwaway test-only
+# password, never a production credential. Production's digest lives only
+# in the server .env (DOUBAO2API_ADMIN_PASSWORD_SHA256).
+TEST_ADMIN_PASSWORD = "test-admin-password-20261113"
+os.environ["DOUBAO2API_ADMIN_PASSWORD_SHA256"] = hashlib.sha256(
+    TEST_ADMIN_PASSWORD.encode("utf-8")).hexdigest()
 
 os.environ.setdefault("DOUBAO_SESSION_FILE", os.path.join(tempfile.gettempdir(), "doubao-unified-test-session.json"))
 # Make sure no stray session leaks into the test.
@@ -25,7 +33,20 @@ from app import app  # noqa: E402
 from doubao_client import build_completion_request, extract_text_from_event  # noqa: E402
 from models import WEB_MODELS, WORK_MODELS, REFERENCE_MODELS, find_model  # noqa: E402
 
-client = TestClient(app)
+
+def admin_client():
+    """A fresh TestClient already logged in as admin."""
+    c = TestClient(app)
+    r = c.post("/auth/login", json={"username": "admin", "password": TEST_ADMIN_PASSWORD})
+    assert r.status_code == 200, r.text
+    return c
+
+
+def anon_client():
+    return TestClient(app)
+
+
+client = admin_client()
 
 # Work-task model routing, from the public menuConfV2 snapshot
 # (sources/doubaowork-client/evidence/model_table_20261113.json).
@@ -66,11 +87,95 @@ def test_root_serves_console_not_404():
     assert "聊天测试" in r.text
 
 
+def test_root_anon_serves_login_page_not_console():
+    r = anon_client().get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "请先登录" in r.text
+    assert "服务状态" not in r.text
+    assert "聊天测试" not in r.text
+
+
 def test_static_index_served():
     r = client.get("/static/index.html")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "doubao2api 控制台" in r.text
+
+
+def test_static_index_anon_is_401():
+    r = anon_client().get("/static/index.html")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "admin_unauthorized"
+
+
+def test_static_login_page_is_public():
+    r = anon_client().get("/static/login.html")
+    assert r.status_code == 200
+    assert "请先登录" in r.text
+
+
+def test_admin_endpoints_anon_are_401():
+    anon = anon_client()
+    assert anon.get("/admin").status_code == 401
+    assert anon.get("/v1/session/status").status_code == 401
+    assert anon.post("/v1/session/cookie", json={"sessionid": "x"}).status_code == 401
+    assert anon.post("/v1/session/qr-login", json={}).status_code == 401
+    assert anon.post("/v1/session/verify", json={}).status_code == 401
+    r = anon.post("/v1/chat/completions",
+                  json={"model": "doubao", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "admin_unauthorized"
+
+
+def test_health_and_models_stay_public():
+    anon = anon_client()
+    assert anon.get("/health").status_code == 200
+    r = anon.get("/v1/models")
+    assert r.status_code == 200
+    assert len(r.json()["data"]) == 34
+
+
+def test_login_wrong_password_is_generic_401():
+    anon = anon_client()
+    r = anon.post("/auth/login", json={"username": "admin", "password": "wrong"},
+                  headers={"X-Forwarded-For": "203.0.113.10"})
+    assert r.status_code == 401
+    assert r.json()["error"]["message"] == "账号或密码错误"
+    r2 = anon.post("/auth/login", json={"username": "not-admin", "password": TEST_ADMIN_PASSWORD},
+                   headers={"X-Forwarded-For": "203.0.113.11"})
+    assert r2.status_code == 401
+    assert r2.json()["error"]["message"] == "账号或密码错误"
+
+
+def test_login_success_then_logout():
+    c = anon_client()
+    assert c.get("/auth/status").json() == {"logged_in": False, "username": None}
+    r = c.post("/auth/login", json={"username": "admin", "password": TEST_ADMIN_PASSWORD})
+    assert r.status_code == 200
+    assert r.json()["logged_in"] is True
+    assert c.get("/auth/status").json() == {"logged_in": True, "username": "admin"}
+    assert "服务状态" in c.get("/").text
+    r = c.post("/auth/logout")
+    assert r.status_code == 200
+    assert c.get("/auth/status").json() == {"logged_in": False, "username": None}
+    assert "请先登录" in c.get("/").text
+
+
+def test_login_lockout_after_five_failures():
+    anon = anon_client()
+    headers = {"X-Forwarded-For": "203.0.113.99"}
+    for _ in range(5):
+        r = anon.post("/auth/login", json={"username": "admin", "password": "wrong"},
+                      headers=headers)
+        assert r.status_code == 401
+    r = anon.post("/auth/login", json={"username": "admin", "password": "wrong"},
+                  headers=headers)
+    assert r.status_code == 429
+    # Even the right password is refused while locked.
+    r = anon.post("/auth/login", json={"username": "admin", "password": TEST_ADMIN_PASSWORD},
+                  headers=headers)
+    assert r.status_code == 429
 
 
 def test_health_not_ready_without_account():
