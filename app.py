@@ -14,11 +14,12 @@ POST /v1/session/verify gets a real upstream 200. See DESIGN.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -30,6 +31,25 @@ from auth import (is_verified, load_cookies, load_session_params,
 from doubao_client import DoubaoClient, UpstreamError, extract_text_from_event
 from models import WEB_MODELS, find_model, list_models_payload
 from signing_fallback import SigningUnavailable, is_signature_error  # noqa: F401  (fallback contract)
+from tool_calling import (build_continuation_prompt, coerce_tool_arguments,
+                          convert_messages_with_tools,
+                          deduplicate_continuation,
+                          detect_truncated_tool_call, filter_tool_calls,
+                          has_complete_tool_calls, is_tool_call_start,
+                          parse_tool_calls_xml, strip_tool_call_blocks,
+                          tool_choice_instruction)
+
+# Tool-call rounds are logged (model, tools, parsed calls, finish reason,
+# dropped rounds, continuation) so a multi-round agent session is
+# auditable per request. Nothing credential-bearing is logged.
+_tool_log = logging.getLogger("doubao2api.tools")
+
+
+def _tool_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 app = FastAPI(title="doubao2api-unified", version="0.2.2-admin-auth")
 
@@ -295,6 +315,93 @@ def _openai_response(model_id: str, text: str) -> Dict[str, Any]:
     }
 
 
+def _openai_tool_response(model_id: str, text: str,
+                          tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """OpenAI-format response for a turn that ends in tool calls.
+
+    ``text`` is the model's reply with the <tool_call> blocks stripped
+    (may be "" -> None, per OpenAI convention when only calls remain).
+    The calls themselves were parsed from the model's text output --
+    the Doubao web chat API has no native tool_calls channel, so this is
+    text simulation (wang's tool_calling.py), not a protocol feature.
+    """
+    now = int(time.time())
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model_id,
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant",
+                                 "content": text or None,
+                                 "tool_calls": tool_calls},
+                     "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "note": "usage 为 0：上游 SSE 不返回 token 数，不编造。tool_calls 系文本仿真解析，非上游原生通道。",
+    }
+
+
+def _tool_names(tools: List[Dict[str, Any]]) -> List[str]:
+    return [((t.get("function") or {}).get("name") or "")
+            for t in (tools or []) if isinstance(t, dict)]
+
+
+def _build_tool_prompt(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
+                       tool_choice: Any) -> str:
+    """Flatten one OpenAI tool turn into the single text prompt Doubao gets.
+
+    The client drives the loop: it executes the tools and sends role:tool
+    results back, and this prompt carries the tool definitions, the whole
+    history (assistant tool_calls reconstructed as <tool_call> blocks,
+    tool results as [工具调用结果] text) and the current task, back to
+    the model on every round. Old rounds past DOUBAO_TOOL_MAX_ROUNDS
+    (default 5) are dropped inside convert_messages_with_tools.
+    """
+    prompt = convert_messages_with_tools(
+        messages, tools,
+        max_chars=_tool_env_int("DOUBAO_TOOL_MAX_PROMPT_CHARS", 70000),
+        max_tool_rounds=_tool_env_int("DOUBAO_TOOL_MAX_ROUNDS", 5))
+    instruction = tool_choice_instruction(tool_choice, tools)
+    if instruction:
+        prompt += f"\n\n[工具选择要求]\n{instruction}"
+    return prompt
+
+
+def _parse_tool_turn(text: str, tools: List[Dict[str, Any]],
+                     parallel: Optional[bool]) -> Optional[List[Dict[str, Any]]]:
+    """Parse + whitelist + coerce one model reply into OpenAI tool_calls."""
+    parsed = parse_tool_calls_xml(text) if text else None
+    parsed = filter_tool_calls(parsed, tools)
+    if not parsed:
+        return None
+    parsed = coerce_tool_arguments(parsed)
+    if parallel is False and len(parsed) > 1:
+        _tool_log.info("parallel_tool_calls=false: keeping first of %d calls",
+                       len(parsed))
+        parsed = parsed[:1]
+    return parsed
+
+
+async def _tool_turn_text(client: DoubaoClient, tool_messages: List[Dict[str, Any]],
+                          profile: Dict[str, Any], model_id: str,
+                          tools: List[Dict[str, Any]]) -> str:
+    """One upstream text call for a tool turn, with a single auto-continue.
+
+    If the model was cut off mid-<tool_call> (truncated output), ask once
+    for a continuation and deduplicate the join, exactly as wang does for
+    qianwen. One attempt only, then whatever we have is what we parse.
+    """
+    text = await client.chat_completion(tool_messages, profile)
+    if text and detect_truncated_tool_call(text):
+        _tool_log.info("model=%s truncated tool_call, auto-continuing once",
+                       model_id)
+        cont = await client.chat_completion(
+            [{"role": "user", "content": build_continuation_prompt(text)}],
+            profile)
+        text = deduplicate_continuation(text, cont or "")
+    return text
+
+
 async def _chat_stream_sse(model_id: str, messages: list, profile: Dict[str, Any]):
     """Yield OpenAI-format SSE chunks from the upstream text stream."""
     client = DoubaoClient(load_cookies(), load_session_params())
@@ -327,6 +434,102 @@ async def _chat_stream_sse(model_id: str, messages: list, profile: Dict[str, Any
     yield "data: [DONE]\n\n"
 
 
+async def _chat_stream_sse_tools(model_id: str, tool_messages: list,
+                                 profile: Dict[str, Any],
+                                 tools: List[Dict[str, Any]],
+                                 parallel: Optional[bool]):
+    """Stream one tool turn as OpenAI SSE chunks.
+
+    Text before the first <tool_call> is emitted as content deltas as it
+    arrives (held back only from the first "<tool_call" -- or a tail that
+    could become one -- exactly like Magpie's Streamer/heldFrom); the
+    tool calls themselves are emitted as tool_calls deltas at the end,
+    with finish_reason "tool_calls". A reply that parses to no call is
+    streamed as plain text with finish_reason "stop". A complete-looking
+    block that fails to parse is flushed as content, never swallowed
+    (wang's behaviour in _stream_chat).
+    """
+    client = DoubaoClient(load_cookies(), load_session_params())
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    def chunk(delta: Dict[str, Any], finish: str | None = None) -> str:
+        payload = {"id": chunk_id, "object": "chat.completion.chunk",
+                   "created": created, "model": model_id,
+                   "choices": [{"index": 0, "delta": delta,
+                                "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def held_from(text: str) -> int:
+        at = text.find("<tool_call>")
+        if at >= 0:
+            return at
+        for n in range(min(len("<tool_call>") - 1, len(text)), 0, -1):
+            if "<tool_call>".startswith(text[-n:]):
+                return len(text) - n
+        return len(text)
+
+    full = ""
+    emitted = ""
+    shown = 0
+    try:
+        async for event in client.chat_completion_stream(tool_messages, profile):
+            etype = event.get("event", "")
+            if etype in ("error", "STREAM_ERROR"):
+                err = (event.get("data", {}) or {}).get("error_msg", "upstream error")
+                yield f"data: {json.dumps({'error': {'code': 'upstream_error', 'message': str(err)}}, ensure_ascii=False)}\n\n"
+                return
+            if etype in ("STREAM_MSG_NOTIFY", "STREAM_CHUNK", "CHUNK_DELTA"):
+                text = extract_text_from_event(event)
+                if not text or text.startswith("[错误]"):
+                    continue
+                # Same accumulation rule as DoubaoClient.chat_completion:
+                # NOTIFY is a full snapshot, CHUNK/DELTA append.
+                full = text if etype == "STREAM_MSG_NOTIFY" else emitted + text
+                emitted = full
+                upto = held_from(full)
+                if upto > shown:
+                    yield chunk({"content": full[shown:upto]})
+                    shown = upto
+            if etype in ("SSE_REPLY_END", "STREAM_END"):
+                break
+    except UpstreamError as exc:
+        yield f"data: {json.dumps({'error': {'code': 'upstream_error', 'message': str(exc)}}, ensure_ascii=False)}\n\n"
+        return
+    if detect_truncated_tool_call(full):
+        _tool_log.info("model=%s stream truncated tool_call, auto-continuing once",
+                       model_id)
+        try:
+            cont = await client.chat_completion(
+                [{"role": "user", "content": build_continuation_prompt(full)}],
+                profile)
+            full = deduplicate_continuation(full, cont or "")
+            emitted = full
+        except (UpstreamError, Exception) as exc:  # noqa: BLE001 -- continuation is best-effort
+            _tool_log.warning("tool auto-continue failed: %s", exc)
+    parsed = _parse_tool_turn(full, tools, parallel)
+    if parsed:
+        _tool_log.info("model=%s stream tool_calls=%s finish=tool_calls",
+                       model_id, [c["function"]["name"] for c in parsed])
+        for idx, tc in enumerate(parsed):
+            yield chunk({"role": "assistant", "content": None,
+                         "tool_calls": [{"index": idx, "id": tc["id"],
+                                         "type": "function",
+                                         "function": {"name": tc["function"]["name"],
+                                                      "arguments": ""}}]})
+            yield chunk({"tool_calls": [{"index": idx,
+                                         "function": {"arguments": tc["function"]["arguments"]}}]})
+        yield chunk({}, finish="tool_calls")
+    else:
+        if has_complete_tool_calls(full) and not parsed:
+            _tool_log.warning("model=%s tool_call XML present but unparseable; "
+                              "flushing as content", model_id)
+        if shown < len(full):
+            yield chunk({"content": full[shown:]})
+        yield chunk({}, finish="stop")
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     err = _admin_error(request)
@@ -354,7 +557,56 @@ async def chat_completions(request: Request):
     if not is_verified():
         return _upstream_error()  # 503 upstream_not_verified
     model_id = profile["id"]
+    # ── Tool calling (text simulation; see tool_calling.py) ──
+    # The Doubao web chat API has no native tool_calls channel, so tools
+    # are injected into the prompt as text and the model's <tool_call>
+    # blocks are parsed back into OpenAI tool_calls. The loop itself is
+    # client-driven, as in the OpenAI protocol: the client executes the
+    # tools and sends role:tool results back, and the next request feeds
+    # them to Doubao again. This branch is what makes that loop work --
+    # without it, tools in the request were silently ignored and every
+    # agent client stopped after round one.
+    raw_tools = body.get("tools") or []
+    tool_choice = body.get("tool_choice", "auto")
+    has_tools = bool(raw_tools) and tool_choice != "none"
+    tools: List[Dict[str, Any]] = []
+    if has_tools:
+        if not isinstance(raw_tools, list) or not all(
+                isinstance(t, dict) and isinstance(t.get("function"), dict)
+                and t["function"].get("name") for t in raw_tools):
+            return _openai_error(
+                "bad_request",
+                "tools 必须是 [{type: 'function', function: {name, description, parameters}}] 列表",
+                400)
+        tools = [t for t in raw_tools if t.get("type", "function") == "function"]
+        if not tools:
+            return _openai_error("bad_request", "tools 里没有 type=function 的工具", 400)
+        rounds_in = sum(1 for m in messages
+                        if isinstance(m, dict) and m.get("role") == "tool")
+        _tool_log.info("model=%s tools=%s tool_choice=%r tool_rounds_in_history=%d",
+                       model_id, _tool_names(tools), tool_choice, rounds_in)
     try:
+        if has_tools:
+            tool_messages = [{"role": "user",
+                              "content": _build_tool_prompt(messages, tools, tool_choice)}]
+            if body.get("stream"):
+                return StreamingResponse(
+                    _chat_stream_sse_tools(model_id, tool_messages, profile, tools,
+                                           body.get("parallel_tool_calls")),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            client = DoubaoClient(load_cookies(), load_session_params())
+            text = await _tool_turn_text(client, tool_messages, profile,
+                                         model_id, tools)
+            parsed = _parse_tool_turn(text, tools, body.get("parallel_tool_calls"))
+            if parsed:
+                _tool_log.info("model=%s tool_calls=%s finish=tool_calls",
+                               model_id, [c["function"]["name"] for c in parsed])
+                return _openai_tool_response(
+                    model_id, strip_tool_call_blocks(text), parsed)
+            _tool_log.info("model=%s tools sent but no call parsed; finish=stop",
+                           model_id)
+            return _openai_response(model_id, text)
         if body.get("stream"):
             return StreamingResponse(
                 _chat_stream_sse(model_id, messages, profile),

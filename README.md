@@ -38,7 +38,7 @@
 
 **诚实标注：** 全部 10 个新模型在 `/v1/models` 里 `verified_routing=false`。key 是真的（公开页可重复抓取），但“登录后调了就通”尚未验证，不要把未实测模型当已通模型。
 
-**上限（别指望绕过）：** 原生聊天 SSE 回包只有文本块，没有原生 `tool_calls`。编程软件要“客户端定义工具 → 上游返回结构化 tool call → 客户端执行”的循环，两条路（原生 API 路、Magpie UI 驱动路）都给不了，天花板是文本仿真（Magpie 的 `<tool_call>` 提示词格式）。另外多轮对话会被压平成一条文本发过去，不保留真多轮会话状态；`aggregate_params.mode_id` 与 `provider_id` 按 Hu410 抓包发空字符串，是否要填 `mode_id="3"` / 非空 `provider_id` 待登录后实测确认。
+**上限（说清楚，不认命）：** 原生聊天 SSE 回包只有文本块，没有原生 `tool_calls` 通道——这一点是真的，三家独立项目一致证实（见 `reports/toolcall-ceiling-break-20261113.md`）。但“没有原生通道”不等于“编程软件用不了工具循环”：本网关已按 wang 的已验证做法实现了文本仿真工具循环（见下节“工具调用”），Claude Code / Codex / OpenCode 发 OpenAI `tools` 就能拿到 `tool_calls`、执行完把结果发回来继续循环。模型本身的原生 Function Calling 只存在于付费的火山方舟 API，不属于这条网页反代通道。另外多轮对话会被压平成一条文本发过去，不保留真多轮会话状态；`aggregate_params.mode_id` 与 `provider_id` 按 Hu410 抓包发空字符串，是否要填 `mode_id="3"` / 非空 `provider_id` 待登录后实测确认。
 
 ## 待实测（需登录账号）
 
@@ -74,6 +74,17 @@ curl http://127.0.0.1:8793/v1/models
 `/v1/models` 返回可路由模型 34 个（豆包 8 + 通义 16 + 工作任务 10），另附 `reference_models`（火山方舟 ARK 参考，不可网页路由，不编造 bot_id）。完整清单见 `../reports/models-20261112.md` 与 `../reports/doubaowork-client-deepdive-20261113.md`。每个可路由模型带 `model_item_key` / `agent_mode` / `conversation_mode` / `reasoning_effort` / `verified_routing` / `billing_multiplier`（新模型才有倍率字段）。
 
 聊天请求按模型档案构建上游请求体（见 `doubao_client.py:build_completion_request`）：有 `model_item_key` 的模型写三处，无 key 的 wang 旧模型（doubao-expert、doubao-pro-chat）走 `need_deep_think`。未知模型 400 `model_not_found`，非聊天模型走聊天端点 400 `model_not_chat`。
+
+## 工具调用（Tool Calling，文本仿真循环）
+
+`POST /v1/chat/completions` 接受 OpenAI `tools` / `tool_choice` / `parallel_tool_calls`（实现在 `tool_calling.py`，移植自 wang `doubao2api/tool_calling.py`，Apache 2.0）：
+
+- 有 `tools` 且 `tool_choice != "none"` 时，工具定义以 `<tool_call>` 提示词格式注入，模型回的 `<tool_call>` 块被解析回 OpenAI `tool_calls`，`finish_reason` 为 `tool_calls`；流式同样以 `tool_calls` delta 发出。`tool_choice: "required"` / 指定函数名会强制要求调用；`"none"` 则不注入工具。
+- **循环是客户端驱动的**（OpenAI 协议标准）：客户端执行工具后把 `role: tool` 结果发回来，下一次请求网关再把工具定义、历史（含重建的 `<tool_call>` 与 `[工具调用结果]`）喂给豆包。网关不替客户端执行工具，也不内部死循环。
+- 轮数上限：`DOUBAO_TOOL_MAX_ROUNDS`（默认 5，可配），超过后最旧的工具轮次从展平后的提示词里丢掉（留标记、记日志），原始任务永远保留；单条工具结果截断 12000 字符，提示词总预算 70000 字符（`DOUBAO_TOOL_MAX_PROMPT_CHARS`）。
+- 截断续接：模型在 `<tool_call>` 中间被截断时，网关自动续接一次（去重拼接），再解析；解析不到的完整块会原样当文本回给客户端，绝不吞掉。
+- 不在客户端工具列表里的工具名会被过滤掉并记日志；参数名按 wang 的映射表自动纠正（如 `cmd` → `command`）。
+- 诚实边界：这是文本仿真，不是上游原生通道。wang 对千问路线的 live 验证是“思考+工具共存，已验证可用”；豆包路线用同一模块，但本网关尚未用登录账号对上游实测过各模型的工具调用成功率——见 `reports/toolcall-ceiling-break-20261113.md`。
 
 ## 设计
 
