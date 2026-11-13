@@ -17,10 +17,12 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from auth import (is_verified, load_cookies, load_session_params,
                   mark_verified, session_status, store_session)
@@ -28,10 +30,26 @@ from doubao_client import DoubaoClient, UpstreamError, extract_text_from_event
 from models import WEB_MODELS, find_model, list_models_payload
 from signing_fallback import SigningUnavailable, is_signature_error  # noqa: F401  (fallback contract)
 
-app = FastAPI(title="doubao2api-unified", version="0.2.0-work-models")
+app = FastAPI(title="doubao2api-unified", version="0.2.1-console")
 
 # In-memory expert-degradation flag (wang ExpertQuotaTracker, skeleton form).
 _EXPERT_DEGRADED = False
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def console_index():
+    """Frontend console: single-file static page (no CDN dependency).
+
+    Root used to 404 ({"detail": "Not Found"}); it now serves the console.
+    """
+    index = _STATIC_DIR / "index.html"
+    if not index.is_file():
+        return JSONResponse({"detail": "控制台页面缺失：static/index.html 不存在"}, status_code=500)
+    return FileResponse(str(index), media_type="text/html; charset=utf-8")
 
 
 def _require_api_key(request: Request) -> bool:
@@ -88,7 +106,7 @@ async def list_models(request: Request):
 @app.get("/admin")
 async def admin():
     st = session_status()
-    return {"service": "doubao2api-unified", "version": "0.2.0-work-models",
+    return {"service": "doubao2api-unified", "version": "0.2.1-console",
             "logged_in": st["logged_in"], "verified": st["verified"],
             "models_routable": len(WEB_MODELS),
             "routing_verified_count": sum(1 for m in WEB_MODELS if m.get("verified_routing")),

@@ -4,6 +4,10 @@
 
 > **状态：已部署 AWS 悉尼，域名 `doubao2api.xzxyuan.l.cd`，无账号实测。** 仓库 `xingluoyuankong/doubao2api`，服务端口 127.0.0.1:8793。无账号时 `/health` 为 `not_ready`，聊天/生图一律 401，账号实测待主人提供豆包账号后做。
 
+## 前端控制台（2026-11-13 新增，v0.2.1）
+
+根路径 `/` 返回控制台（单文件 `static/index.html`，内联 CSS/JS，不依赖外部 CDN）。内容：服务状态（`/health`）、模型列表（34 个，分豆包聊天 / 豆包工作 10 个 / 通义千问 / 生成模型四组，带 `model_item_key`、倍率、`verified_routing` 标注）、登录区（扫码登录、Cookie 导入、会话导入，对应现有后端接口）、验证按钮（`POST /v1/session/verify`）、聊天测试区（选模型发一句话，无账号显示 401 不伪造成功）。后端只加了 `/` 与 `/static/*` 两个路由，现有 API 一字未动。
+
 ## 工作任务模型（2026-11-13 新增，v0.2.0）
 
 豆包工作 11 月 12 日官宣接入第三方模型。路由标识来自未登录 `GET https://www.doubao.com/chat` 的页面内嵌 `window._ROUTER_DATA`（`menuConfV2`，2026-11-13 00:21 抓取，`pc_version 3.45.5`），抽取见 `../sources/doubaowork-client/evidence/model_table_20261113.json`，深挖报告见 `../reports/doubaowork-client-deepdive-20261113.md`。

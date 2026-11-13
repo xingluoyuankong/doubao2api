@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doubao2api 控制台</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f4f5f7;color:#222;font-size:14px;line-height:1.6}
+  header{background:#111827;color:#fff;padding:16px 20px}
+  header h1{margin:0;font-size:20px}
+  header p{margin:4px 0 0;color:#9ca3af;font-size:13px}
+  main{max-width:960px;margin:0 auto;padding:16px}
+  section{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:16px}
+  h2{margin:0 0 12px;font-size:16px}
+  h3{margin:16px 0 8px;font-size:14px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#f59e0b;color:#fff}
+  .badge.ok{background:#16a34a}.badge.bad{background:#dc2626}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+  .kv{background:#f9fafb;border:1px solid #eee;border-radius:6px;padding:8px 10px}
+  .kv b{display:block;font-size:12px;color:#6b7280;font-weight:400}
+  .kv span{font-size:15px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;vertical-align:top}
+  th{color:#6b7280;font-weight:400}
+  code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#f3f4f6;padding:1px 4px;border-radius:4px;word-break:break-all}
+  input,select,textarea{width:100%;padding:8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;margin:4px 0 8px}
+  textarea{font-family:ui-monospace,Menlo,monospace;min-height:70px}
+  button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;margin-right:8px}
+  button.secondary{background:#6b7280}
+  button:disabled{background:#9ca3af;cursor:not-allowed}
+  pre{background:#111827;color:#e5e7eb;padding:12px;border-radius:6px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word}
+  .note{color:#6b7280;font-size:13px}
+  .warn{color:#b45309}
+  .err{color:#dc2626}
+  .ok{color:#16a34a}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  label{font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>doubao2api 控制台</h1>
+  <p>豆包 + 通义千问网页端反代整合版 · 上游 Hu410 协议 POST /chat/completion · <span id="ver">v0.2.1-console</span></p>
+</header>
+<main>
+
+<section id="status-sec">
+  <h2>服务状态 <span id="status-badge" class="badge">加载中…</span> <button class="secondary" onclick="loadHealth()">刷新</button></h2>
+  <div class="grid" id="status-grid"></div>
+  <h3>原始 /health</h3>
+  <pre id="health-raw">加载中…</pre>
+</section>
+
+<section id="models-sec">
+  <h2>模型列表 <span class="note" id="models-count"></span> <button class="secondary" onclick="loadModels()">刷新</button></h2>
+  <p class="note">verified_routing=false 表示路由 key 来自公开资料、尚未经登录账号实测放行，不是已通模型。原生聊天 SSE 只有文本块，没有原生 tool_calls。</p>
+  <h3>豆包聊天</h3>
+  <table><thead><tr><th>模型</th><th>model_item_key</th><th>倍率</th><th>已验证路由</th></tr></thead><tbody id="models-doubao"></tbody></table>
+  <h3>豆包工作（工作任务模式 mode_id=3，agent_mode=1）</h3>
+  <table><thead><tr><th>模型</th><th>model_item_key</th><th>倍率</th><th>已验证路由</th></tr></thead><tbody id="models-work"></tbody></table>
+  <h3>通义千问（走 qianwen.com）</h3>
+  <table><thead><tr><th>模型</th><th>model_item_key</th><th>倍率</th><th>已验证路由</th></tr></thead><tbody id="models-qianwen"></tbody></table>
+  <h3>生成模型</h3>
+  <table><thead><tr><th>模型</th><th>model_item_key</th><th>倍率</th><th>已验证路由</th></tr></thead><tbody id="models-gen"></tbody></table>
+</section>
+
+<section id="login-sec">
+  <h2>登录</h2>
+  <p class="note">存会话 ≠ 已验证。只有上游真正返回 200 后，verified 才会变 true。会话文件 0600，凭证不回显、不记日志。</p>
+  <div class="row"><b>当前会话：</b><span id="session-state">加载中…</span>
+    <button class="secondary" onclick="loadSession()">刷新会话状态</button>
+    <button onclick="verifySession()">验证会话（POST /v1/session/verify）</button>
+  </div>
+  <pre id="session-raw"></pre>
+
+  <h3>1. 扫码登录</h3>
+  <p class="note">wang 流程：CSRF → scan_qrcode → 豆包 App 扫码。当前后端明确说明：骨架/部署态无浏览器时不伪造二维码。</p>
+  <button onclick="qrLogin()">发起扫码登录</button>
+  <pre id="qr-out">未发起。</pre>
+
+  <h3>2. Cookie 导入</h3>
+  <label>sessionid</label>
+  <input id="cookie-sessionid" type="password" placeholder="粘贴豆包 sessionid" autocomplete="off">
+  <button onclick="cookieLogin()">导入 Cookie</button>
+  <pre id="cookie-out"></pre>
+
+  <h3>3. 会话导入（已登录浏览器会话）</h3>
+  <p class="note">豆包无公开 OAuth 客户端流程，此口即该路径。JSON 格式：{"cookies": {"sessionid": "..."}, "params": {}}</p>
+  <textarea id="import-json" placeholder='{"cookies": {"sessionid": "..."}, "params": {}}'></textarea>
+  <button onclick="importSession()">导入会话</button>
+  <pre id="import-out"></pre>
+</section>
+
+<section id="chat-sec">
+  <h2>聊天测试</h2>
+  <p class="note">无账号时返回 401 not_logged_in；会话未验证时 503。绝不伪造成功。</p>
+  <label>模型</label>
+  <select id="chat-model"></select>
+  <label>消息</label>
+  <textarea id="chat-text">hi</textarea>
+  <div class="row">
+    <label style="font-weight:400"><input type="checkbox" id="chat-stream" style="width:auto"> 流式（SSE）</label>
+    <button onclick="sendChat()">发送</button>
+  </div>
+  <h3>回包</h3>
+  <pre id="chat-out">未发送。</pre>
+</section>
+
+<section>
+  <h2>接口一览</h2>
+  <table>
+    <tr><td><code>GET /health</code></td><td>服务状态</td></tr>
+    <tr><td><code>GET /v1/models</code></td><td>模型列表（34 个可路由 + reference_models）</td></tr>
+    <tr><td><code>POST /v1/chat/completions</code></td><td>聊天（OpenAI 兼容，stream 可选）</td></tr>
+    <tr><td><code>POST /v1/session/qr-login</code></td><td>扫码登录</td></tr>
+    <tr><td><code>POST /v1/session/cookie</code></td><td>Cookie 导入</td></tr>
+    <tr><td><code>POST /v1/session/import</code></td><td>会话导入</td></tr>
+    <tr><td><code>POST /v1/session/verify</code></td><td>会话验证（发一次 "hi"，真 200 才 verified）</td></tr>
+    <tr><td><code>GET /v1/session/status</code></td><td>会话状态</td></tr>
+    <tr><td><code>GET /admin</code></td><td>管理状态（只返状态，不暴露凭证）</td></tr>
+  </table>
+  <p class="note">待实测（需登录账号）：扫码登录真扫一次、verify 真 200、逐模型最短请求放行、tool call 形态最终结论、钉死 Bot ID。</p>
+</section>
+
+</main>
+<script>
+const WORK_IDS = ["doubao-work-auto","doubao-2.1-lite","doubao-2.1-pro","deepseek-v4.1-flash","kimi-k3.1-pro","kimi-k3.1-pro-highspeed","kimi-k3","glm-5.3","glm-5.3-flash","deepseek-v4-pro"];
+const DOUBAO_CHAT = ["doubao","doubao-pro","doubao-think","doubao-expert","doubao-pro-chat"];
+const GEN_IDS = ["doubao-image","doubao-music","doubao-video"];
+function show(id, obj){ document.getElementById(id).textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2); }
+async function jfetch(url, opts){
+  const r = await fetch(url, opts);
+  const t = await r.text();
+  let body; try { body = JSON.parse(t); } catch(e){ body = t; }
+  return {status: r.status, body: body};
+}
+function kv(k, v){ return '<div class="kv"><b>'+k+'</b><span>'+v+'</span></div>'; }
+async function loadHealth(){
+  try{
+    const r = await jfetch('/health');
+    const b = r.body || {};
+    show('health-raw', b);
+    const badge = document.getElementById('status-badge');
+    badge.textContent = b.status || ('HTTP '+r.status);
+    badge.className = 'badge ' + (b.status === 'ok' ? 'ok' : (b.status === 'not_ready' ? '' : 'bad'));
+    document.getElementById('status-grid').innerHTML =
+      kv('状态', b.status ?? '-') + kv('已登录 logged_in', String(b.logged_in ?? '-')) +
+      kv('已验证 verified', String(b.verified ?? '-')) + kv('可路由模型', String(b.models_routable ?? '-')) +
+      kv('已验证路由', String(b.routing_verified_count ?? '-')) +
+      kv('上游客户端', b.upstream_client ?? '-') + kv('通义就绪', String(b.qianwen_ready ?? '-')) +
+      kv('专家降级', String(b.expert_degraded ?? '-'));
+  }catch(e){ show('health-raw', '加载失败：' + e); }
+}
+function modelRow(m){
+  return '<tr><td><code>'+m.id+'</code></td><td><code>'+(m.model_item_key ?? '—')+'</code></td><td>'+(m.billing_multiplier ?? '—')+'</td><td>'+(m.verified_routing ? '<span class="ok">是</span>' : '<span class="warn">否</span>')+'</td></tr>';
+}
+async function loadModels(){
+  try{
+    const r = await jfetch('/v1/models');
+    const b = r.body || {};
+    const data = b.data || [];
+    document.getElementById('models-count').textContent = '共 ' + data.length + ' 个可路由模型';
+    const byId = {}; data.forEach(function(m){ byId[m.id] = m; });
+    function fill(tbodyId, ids){
+      document.getElementById(tbodyId).innerHTML = ids.filter(function(id){ return byId[id]; }).map(function(id){ return modelRow(byId[id]); }).join('') || '<tr><td colspan="4">无</td></tr>';
+    }
+    fill('models-doubao', DOUBAO_CHAT);
+    fill('models-work', WORK_IDS);
+    fill('models-qianwen', data.map(function(m){ return m.id; }).filter(function(id){ return id.indexOf('qianwen') === 0 || id.indexOf('Qwen') === 0; }));
+    fill('models-gen', GEN_IDS);
+    const sel = document.getElementById('chat-model');
+    const chatIds = data.map(function(m){ return m.id; }).filter(function(id){ return GEN_IDS.indexOf(id) < 0; });
+    sel.innerHTML = chatIds.map(function(id){ return '<option value="'+id+'">'+id+'</option>'; }).join('');
+    if (chatIds.indexOf('doubao') >= 0) sel.value = 'doubao';
+  }catch(e){ document.getElementById('models-count').textContent = '加载失败：' + e; }
+}
+async function loadSession(){
+  try{
+    const r = await jfetch('/v1/session/status');
+    document.getElementById('session-state').textContent = 'logged_in=' + r.body.logged_in + '，verified=' + r.body.verified;
+    show('session-raw', r.body);
+  }catch(e){ document.getElementById('session-state').textContent = '加载失败：' + e; }
+}
+async function qrLogin(){
+  show('qr-out', '发起中…');
+  const r = await jfetch('/v1/session/qr-login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  show('qr-out', 'HTTP ' + r.status + '\n' + JSON.stringify(r.body, null, 2));
+}
+async function cookieLogin(){
+  const v = document.getElementById('cookie-sessionid').value.trim();
+  if (!v){ show('cookie-out', '请先填 sessionid。'); return; }
+  const r = await jfetch('/v1/session/cookie', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sessionid: v})});
+  show('cookie-out', 'HTTP ' + r.status + '\n' + JSON.stringify(r.body, null, 2));
+  loadSession(); loadHealth();
+}
+async function importSession(){
+  let parsed;
+  try { parsed = JSON.parse(document.getElementById('import-json').value); }
+  catch(e){ show('import-out', 'JSON 解析失败：' + e); return; }
+  const r = await jfetch('/v1/session/import', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(parsed)});
+  show('import-out', 'HTTP ' + r.status + '\n' + JSON.stringify(r.body, null, 2));
+  loadSession(); loadHealth();
+}
+async function verifySession(){
+  show('session-raw', '验证中：向已存会话发一次 "hi"，等上游真实返回…');
+  const r = await jfetch('/v1/session/verify', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: 'doubao'})});
+  show('session-raw', 'HTTP ' + r.status + '\n' + JSON.stringify(r.body, null, 2));
+  loadSession(); loadHealth();
+}
+async function sendChat(){
+  const model = document.getElementById('chat-model').value;
+  const text = document.getElementById('chat-text').value.trim();
+  const stream = document.getElementById('chat-stream').checked;
+  if (!text){ show('chat-out', '请先填消息。'); return; }
+  show('chat-out', '发送中…');
+  try{
+    const r = await fetch('/v1/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: model, messages: [{role: 'user', content: text}], stream: stream})});
+    const t = await r.text();
+    show('chat-out', 'HTTP ' + r.status + '\n' + t);
+  }catch(e){ show('chat-out', '发送失败：' + e); }
+}
+loadHealth(); loadModels(); loadSession();
+</script>
+</body>
+</html>

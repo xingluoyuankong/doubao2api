@@ -55,6 +55,24 @@ EXPECTED_MULTIPLIERS = {
 }
 
 
+def test_root_serves_console_not_404():
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "doubao2api 控制台" in r.text
+    assert "服务状态" in r.text
+    assert "模型列表" in r.text
+    assert "登录" in r.text
+    assert "聊天测试" in r.text
+
+
+def test_static_index_served():
+    r = client.get("/static/index.html")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "doubao2api 控制台" in r.text
+
+
 def test_health_not_ready_without_account():
     r = client.get("/health")
     assert r.status_code == 200
